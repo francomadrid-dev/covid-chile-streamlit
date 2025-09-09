@@ -43,7 +43,7 @@ def _get(url, params=None, timeout=30, retries=3):
 @st.cache_data(ttl=3600)
 def list_locations(country_code="CL", parameter_id=2, limit=2000):
     url = f"{API_BASE}/locations"
-    data = _get(url, params={"country": country_code, "parameters_id": parameter_id, "limit": limit})
+    data = _get(url, params={"country": country_code, "limit": limit})
     rows = []
     for loc in data.get("results", []):
         coords = loc.get("coordinates") or {}
