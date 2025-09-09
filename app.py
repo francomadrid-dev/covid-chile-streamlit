@@ -1,157 +1,183 @@
-
-import io, time
+# app.py — Calidad del Aire Chile (OpenAQ)
+import os, io, time
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="COVID-19 Chile - Dataviz", page_icon="🦠", layout="wide")
+st.set_page_config(page_title="Calidad del Aire Chile (OpenAQ)", layout="wide")
 
-SOURCES = [
-    # 1) raw
-    "https://raw.githubusercontent.com/MinCiencia/Datos-COVID19/master/output/producto3/CasosTotalesCumulativos.csv",
-    # 2) github alt (raw a través de la vista normal)
-    "https://github.com/MinCiencia/Datos-COVID19/raw/master/output/producto3/CasosTotalesCumulativos.csv",
-    # 3) CDN mirror
-    "https://cdn.jsdelivr.net/gh/MinCiencia/Datos-COVID19@master/output/producto3/CasosTotalesCumulativos.csv",
+# ===== Configuración =====
+API_BASE = "https://api.openaq.org/v3"
+API_KEY = st.secrets.get("OPENAQ_API_KEY", os.environ.get("OPENAQ_API_KEY", ""))
+HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
+
+PARAMETERS = [
+    {"name": "pm25", "id": 2, "units": "µg/m³"},
+    {"name": "pm10", "id": 1, "units": "µg/m³"},
+    {"name": "o3",   "id": 10, "units": "ppm"},
+    {"name": "no2",  "id": 7,  "units": "ppm"},
+    {"name": "so2",  "id": 9,  "units": "ppm"},
+    {"name": "co",   "id": 8,  "units": "ppm"},
 ]
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Streamlit app for educational use)"}
+def need_key():
+    if not API_KEY:
+        st.error("Falta la API key de OpenAQ. Ve a Manage app → Secrets y agrega:\n\nOPENAQ_API_KEY = \"TU_API_KEY\"")
+        st.stop()
 
-@st.cache_data(ttl=60*60)
-def load_data():
-    last_err = None
-    for url in SOURCES:
-        for attempt in range(3):
-            try:
-                resp = requests.get(url, headers=HEADERS, timeout=30)
-                resp.raise_for_status()
-                raw = io.BytesIO(resp.content)
-                df = pd.read_csv(raw)
-                if "Codigo comuna" in df.columns:
-                    df = df.drop(columns=["Codigo comuna"])
-                df = df.melt(id_vars=["Region", "Comuna"], var_name="Fecha", value_name="Casos")
-                df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-                df = df.dropna(subset=["Fecha"])
-                df["Casos"] = pd.to_numeric(df["Casos"], errors="coerce").fillna(0).astype(int)
-                df = df.sort_values(["Region", "Comuna", "Fecha"]).reset_index(drop=True)
-                return df
-            except Exception as e:
-                last_err = e
-                time.sleep(1.5)
-    raise RuntimeError(f"No fue posible descargar el dataset desde las fuentes disponibles: {last_err}")
+def _get(url, params=None, timeout=30, retries=3):
+    need_key()
+    last = None
+    for _ in range(retries):
+        try:
+            r = requests.get(url, headers=HEADERS, params=params or {}, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(1.2)
+    raise RuntimeError(f"Falla GET {url}: {last}")
 
+@st.cache_data(ttl=3600)
+def list_locations(country_code="CL", parameter_id=2, limit=2000):
+    url = f"{API_BASE}/locations"
+    data = _get(url, params={"country": country_code, "parameters_id": parameter_id, "limit": limit})
+    rows = []
+    for loc in data.get("results", []):
+        coords = loc.get("coordinates") or {}
+        sensors = [s for s in loc.get("sensors", []) if s.get("parameter", {}).get("id") == parameter_id]
+        rows.append({
+            "location_id": loc["id"],
+            "name": loc.get("name"),
+            "locality": loc.get("locality"),
+            "provider": (loc.get("provider") or {}).get("name"),
+            "owner": (loc.get("owner") or {}).get("name"),
+            "lat": coords.get("latitude"),
+            "lon": coords.get("longitude"),
+            "timezone": loc.get("timezone"),
+            "sensors": sensors,
+        })
+    return pd.DataFrame(rows)
 
-def compute_daily(df_filtrado):
-    # Calcula casos diarios a partir de acumulados
-    dfd = df_filtrado.copy()
-    dfd["Nuevos"] = dfd.groupby(["Region", "Comuna"])["Casos"].diff().fillna(0).clip(lower=0).astype(int)
-    return dfd
+@st.cache_data(ttl=3600)
+def sensors_by_location(location_id):
+    url = f"{API_BASE}/locations/{location_id}/sensors"
+    data = _get(url)
+    return pd.DataFrame(data.get("results", []))
 
-def kpi_block(df_filtrado):
-    latest = df_filtrado["Fecha"].max()
-    last_val = int(df_filtrado.loc[df_filtrado["Fecha"] == latest, "Casos"].sum())
-    # crecimiento últimos 7 días (si existen)
-    seven_days_before = latest - pd.Timedelta(days=7)
-    prev = int(df_filtrado[df_filtrado["Fecha"] <= seven_days_before].groupby("Comuna")["Casos"].last().sum() if not df_filtrado[df_filtrado["Fecha"] <= seven_days_before].empty else 0)
-    delta = last_val - prev
-    # número de comunas seleccionadas
-    n_comunas = df_filtrado["Comuna"].nunique()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Casos acumulados", f"{last_val:,}".replace(",", "."), delta=f"{delta:+,}".replace(",", "."))
-    c2.metric("Comunas seleccionadas", f"{n_comunas}")
-    c3.metric("Última fecha", latest.strftime("%Y-%m-%d"))
+@st.cache_data(ttl=1800)
+def fetch_days(sensor_id, date_from, date_to):
+    url = f"{API_BASE}/sensors/{sensor_id}/days"
+    params = {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(), "limit": 10000}
+    data = _get(url, params=params)
+    rows = []
+    for r in data.get("results", []):
+        dt = r["period"]["datetimeFrom"]["utc"]
+        rows.append({"date_utc": dt, "value": r["value"]})
+    d = pd.DataFrame(rows)
+    if not d.empty:
+        d["Fecha"] = pd.to_datetime(d["date_utc"]).dt.tz_convert(None)
+        d = d.drop(columns=["date_utc"]).sort_values("Fecha")
+    return d
 
 def main():
-    st.title("📊 COVID-19 en Chile por Comuna")
-    st.caption("Fuente: Ministerio de Ciencia (Repositorio COVID-19). App educativa para análisis y visualización.")
+    st.title("Calidad del Aire • Chile (OpenAQ)")
+    st.caption("Fuentes: OpenAQ v3 (incluye datos de SINCA y otras redes).")
 
-    with st.spinner("Descargando y preparando datos..."):
-        df = load_data()
+    # Controles
+    col1, col2, col3 = st.columns([1,1,2])
+    with col1:
+        pname = st.selectbox("Parámetro", [p["name"] for p in PARAMETERS], index=0)
+        pinfo = next(p for p in PARAMETERS if p["name"] == pname)
+    with col2:
+        hoy = datetime.utcnow().date()
+        fecha_ini = st.date_input("Desde", hoy - timedelta(days=60))
+        fecha_fin = st.date_input("Hasta", hoy)
+        if fecha_ini > fecha_fin:
+            st.error("La fecha 'Desde' no puede ser mayor que 'Hasta'.")
+            st.stop()
+    with col3:
+        st.info("Tip: selecciona 1–3 estaciones para un gráfico más claro.")
 
-    # --- Sidebar de filtros
-    st.sidebar.header("Filtros")
-    regiones = sorted(df["Region"].dropna().unique().tolist())
-    region_sel = st.sidebar.multiselect("Región", regiones, default=[])
+    # Estaciones
+    with st.spinner("Cargando estaciones..."):
+        df_loc = list_locations("CL", pinfo["id"])
+    if df_loc.empty:
+        st.warning("No se encontraron estaciones para ese parámetro en Chile.")
+        st.stop()
 
-    df_reg = df[df["Region"].isin(region_sel)] if region_sel else df.copy()
-    comunas = sorted(df_reg["Comuna"].dropna().unique().tolist())
-    comuna_sel = st.sidebar.multiselect("Comuna", comunas, default=comunas[:1] if comunas else [])
+    df_loc["etiqueta"] = df_loc.apply(
+        lambda r: f"{r['name']} – {r['locality'] or 's/n'} (id {r['location_id']})", axis=1
+    )
+    default_sel = df_loc["etiqueta"].tolist()[:2]
+    sel = st.multiselect("Estaciones disponibles", options=df_loc["etiqueta"].tolist(), default=default_sel)
 
-    # Rango de fechas
-    if not df_reg.empty:
-        min_date = df_reg["Fecha"].min()
-        max_date = df_reg["Fecha"].max()
-    else:
-        min_date = pd.Timestamp("2020-03-01")
-        max_date = pd.Timestamp.today().normalize()
-    fecha_ini, fecha_fin = st.sidebar.date_input("Rango de fechas", (min_date.date(), max_date.date()))
+    if not sel:
+        st.warning("Selecciona al menos una estación.")
+        st.stop()
 
-    # Subset final
-    mask = (df_reg["Comuna"].isin(comuna_sel)) & (df_reg["Fecha"].between(pd.to_datetime(fecha_ini), pd.to_datetime(fecha_fin)))
-    df_view = df_reg[mask].copy()
+    # Serie diaria por estación (promedio de sensores del mismo parámetro)
+    all_series = []
+    with st.spinner("Descargando series diarias..."):
+        for etiqueta in sel:
+            loc_id = int(etiqueta.split("id")[-1].strip(") ").strip())
+            df_sens = sensors_by_location(loc_id)
+            df_sens = df_sens[df_sens["parameter"].apply(lambda x: x.get("id") == pinfo["id"])]
 
-    if df_view.empty:
-        st.warning("No hay datos para los filtros seleccionados. Ajusta Región/Comuna/Fechas.")
-        return
+            series_loc = []
+            for _, s in df_sens.iterrows():
+                sid = int(s["id"])
+                dfd = fetch_days(sid, pd.to_datetime(fecha_ini), pd.to_datetime(fecha_fin))
+                if not dfd.empty:
+                    dfd = dfd.rename(columns={"value": f"sensor_{sid}"}).set_index("Fecha")
+                    series_loc.append(dfd)
+
+            if series_loc:
+                merged = pd.concat(series_loc, axis=1).mean(axis=1).to_frame(name=etiqueta)
+                merged.reset_index(inplace=True)
+                all_series.append(merged)
+
+    if not all_series:
+        st.error("No hay datos diarios en el rango seleccionado para las estaciones escogidas.")
+        st.stop()
+
+    df_final = all_series[0]
+    for extra in all_series[1:]:
+        df_final = df_final.merge(extra, on="Fecha", how="outer")
+    df_final = df_final.sort_values("Fecha")
 
     # KPIs
-    kpi_block(df_view)
+    k1, k2, k3 = st.columns(3)
+    ultimo = df_final.dropna().iloc[-1, 1:].mean()
+    prom_7 = df_final.tail(7).dropna().iloc[:,1:].mean().mean()
+    prom_30 = df_final.tail(30).dropna().iloc[:,1:].mean().mean()
+    k1.metric(f"Último día ({pname})", f"{ultimo:.2f} {pinfo['units']}")
+    k2.metric("Promedio 7 días", f"{prom_7:.2f} {pinfo['units']}")
+    k3.metric("Promedio 30 días", f"{prom_30:.2f} {pinfo['units']}")
 
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["Evolución acumulada", "Casos diarios", "Top comunas (por región)"])
+    # Gráfico
+    fig, ax = plt.subplots(figsize=(10,5))
+    for col in df_final.columns[1:]:
+        ax.plot(df_final["Fecha"], df_final[col], label=col)
+    ax.set_title(f"Serie diaria {pname.upper()} – Chile (OpenAQ)")
+    ax.set_xlabel("Fecha")
+    ax.set_ylabel(f"{pname} ({pinfo['units']})")
+    ax.legend(loc="upper left", fontsize=8)
+    plt.xticks(rotation=45)
+    st.pyplot(fig, clear_figure=True)
 
-    with tab1:
-        st.subheader("Serie temporal - Casos acumulados")
-        fig1, ax1 = plt.subplots()
-        for comuna, dfg in df_view.groupby("Comuna"):
-            ax1.plot(dfg["Fecha"], dfg["Casos"], marker="o", linewidth=1, label=str(comuna))
-        ax1.set_xlabel("Fecha")
-        ax1.set_ylabel("Casos acumulados")
-        ax1.set_title("Evolución de casos acumulados")
-        ax1.tick_params(axis="x", rotation=45)
-        ax1.legend(loc="best", fontsize=8)
-        st.pyplot(fig1, clear_figure=True)
+    st.subheader("Datos (promedio diario por estación seleccionada)")
+    st.dataframe(df_final, use_container_width=True)
 
-        st.download_button(
-            "Descargar datos filtrados (CSV)",
-            data=df_view.to_csv(index=False).encode("utf-8"),
-            file_name="covid_chile_filtrado.csv",
-            mime="text/csv",
-        )
+    csv = df_final.to_csv(index=False).encode("utf-8")
+    st.download_button("Descargar CSV", data=csv, file_name="calidad_aire_chile_diario.csv", mime="text/csv")
 
-        st.dataframe(df_view.tail(20))
-
-    with tab2:
-        st.subheader("Serie temporal - Casos diarios (derivado)")
-        dfd = compute_daily(df_view)
-        fig2, ax2 = plt.subplots()
-        for comuna, dfg in dfd.groupby("Comuna"):
-            ax2.plot(dfg["Fecha"], dfg["Nuevos"], marker="o", linewidth=1, label=str(comuna))
-        ax2.set_xlabel("Fecha")
-        ax2.set_ylabel("Casos nuevos")
-        ax2.set_title("Evolución de casos diarios")
-        ax2.tick_params(axis="x", rotation=45)
-        ax2.legend(loc="best", fontsize=8)
-        st.pyplot(fig2, clear_figure=True)
-        st.dataframe(dfd.tail(20))
-
-    with tab3:
-        st.subheader("Top 10 comunas por casos (dentro de las regiones seleccionadas)")
-        latest = df_view["Fecha"].max()
-        df_latest = df_view[df_view["Fecha"] == latest].copy()
-        top = (df_latest.groupby(["Region", "Comuna"], as_index=False)["Casos"]
-               .sum()
-               .sort_values("Casos", ascending=False)
-               .head(10))
-        st.dataframe(top)
-
-    # Pie de página
     st.markdown("---")
-    st.markdown("**Notas:**")
-    st.markdown("- Los casos diarios se calculan como diferencia de acumulados entre fechas consecutivas por comuna.")
-    st.markdown("- Fuente de datos: Repositorio COVID-19 MinCiencia (GitHub).")
-    st.markdown(f"- Endpoint utilizado: `{DATA_URL}`")
+    st.markdown("**Fuente:** OpenAQ v3 (incluye redes como SINCA).")
+    st.markdown("Docs: Locations / Sensors / Measurements Days.")
+    st.caption("Recuerda configurar tu API key en Secrets como OPENAQ_API_KEY.")
 
 if __name__ == "__main__":
     main()
