@@ -5,14 +5,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 from datetime import datetime, timedelta
-st.sidebar.info(f"API key cargada: {bool(API_KEY)} — largo: {len(API_KEY)}")
+
 st.set_page_config(page_title="Calidad del Aire Chile (OpenAQ)", layout="wide")
 
 # ===== Configuración =====
 API_BASE = "https://api.openaq.org/v3"
 API_KEY = st.secrets.get("OPENAQ_API_KEY", os.environ.get("OPENAQ_API_KEY", ""))
 HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
-
+st.sidebar.info(f"API key cargada: {bool(API_KEY)} — largo: {len(API_KEY)}")
 PARAMETERS = [
     {"name": "pm25", "id": 2, "units": "µg/m³"},
     {"name": "pm10", "id": 1, "units": "µg/m³"},
