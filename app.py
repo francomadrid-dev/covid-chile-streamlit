@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 from datetime import datetime, timedelta
-
+st.sidebar.info(f"API key cargada: {bool(API_KEY)} — largo: {len(API_KEY)}")
 st.set_page_config(page_title="Calidad del Aire Chile (OpenAQ)", layout="wide")
 
 # ===== Configuración =====
