@@ -1,5 +1,5 @@
 
-import io
+import io, time
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -7,27 +7,40 @@ import streamlit as st
 
 st.set_page_config(page_title="COVID-19 Chile - Dataviz", page_icon="🦠", layout="wide")
 
-DATA_URL = "https://raw.githubusercontent.com/MinCiencia/Datos-COVID19/master/output/producto3/CasosTotalesCumulativos.csv"
+SOURCES = [
+    # 1) raw
+    "https://raw.githubusercontent.com/MinCiencia/Datos-COVID19/master/output/producto3/CasosTotalesCumulativos.csv",
+    # 2) github alt (raw a través de la vista normal)
+    "https://github.com/MinCiencia/Datos-COVID19/raw/master/output/producto3/CasosTotalesCumulativos.csv",
+    # 3) CDN mirror
+    "https://cdn.jsdelivr.net/gh/MinCiencia/Datos-COVID19@master/output/producto3/CasosTotalesCumulativos.csv",
+]
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Streamlit app for educational use)"}
 
 @st.cache_data(ttl=60*60)
 def load_data():
-    # Descarga y carga en memoria sin depender del disco
-    resp = requests.get(DATA_URL, timeout=30)
-    resp.raise_for_status()
-    raw = io.BytesIO(resp.content)
-    df = pd.read_csv(raw)
-    # Limpieza básica
-    if "Codigo comuna" in df.columns:
-        df = df.drop(columns=["Codigo comuna"])
-    # Convertir a formato largo
-    df = df.melt(id_vars=["Region", "Comuna"], var_name="Fecha", value_name="Casos")
-    # Manejo de fechas y numéricos
-    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-    df = df.dropna(subset=["Fecha"])
-    df["Casos"] = pd.to_numeric(df["Casos"], errors="coerce").fillna(0).astype(int)
-    # Orden
-    df = df.sort_values(["Region", "Comuna", "Fecha"]).reset_index(drop=True)
-    return df
+    last_err = None
+    for url in SOURCES:
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=30)
+                resp.raise_for_status()
+                raw = io.BytesIO(resp.content)
+                df = pd.read_csv(raw)
+                if "Codigo comuna" in df.columns:
+                    df = df.drop(columns=["Codigo comuna"])
+                df = df.melt(id_vars=["Region", "Comuna"], var_name="Fecha", value_name="Casos")
+                df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+                df = df.dropna(subset=["Fecha"])
+                df["Casos"] = pd.to_numeric(df["Casos"], errors="coerce").fillna(0).astype(int)
+                df = df.sort_values(["Region", "Comuna", "Fecha"]).reset_index(drop=True)
+                return df
+            except Exception as e:
+                last_err = e
+                time.sleep(1.5)
+    raise RuntimeError(f"No fue posible descargar el dataset desde las fuentes disponibles: {last_err}")
+
 
 def compute_daily(df_filtrado):
     # Calcula casos diarios a partir de acumulados
